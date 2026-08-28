@@ -1092,6 +1092,79 @@ here rather than silently carried forward unmentioned a third time.
 ### `.github/workflows/ci.yml`
 No changes needed — picks up `tests/generics.rs` automatically.
 
+### CI Run — 62/65 integration tests pass; 3 failures, all in `tests/generics.rs`, all parse errors (never reached the generics logic)
+All three failures traced to the actual reported error before fixing,
+and the root cause turned out to be **narrower and different** than the
+initial hypothesis — worth recording precisely:
+
+- **Initial hypothesis** (reasonable from the error text alone): `Self`
+  used as a parameter *type* (Document 7 §4.1's `other: borrow Self`)
+  wasn't handled by `parse_type()`.
+- **Actual root cause, found by tracing the exact reported error
+  (`"expected \`)\`, found Keyword(SelfType)"` at the precise column) against
+  the real code**: `Self` *alone* already parsed correctly (an existing
+  fallback branch in `parse_type()` already handled `Keyword::SelfType`).
+  The real gap was one step earlier: `parse_type()` had **no branch for
+  `Keyword::Borrow` at all**. When it hit `borrow` (in `other: borrow
+  Self`), it fell through to the generic keyword-as-word fallback and
+  silently *mis-parsed the word "borrow" itself as a bogus type name*
+  (`Type::Named("borrow")`) — succeeding without an error at that point,
+  then leaving `Self` as an unconsumed leftover token, which is what
+  actually produced the reported error one token later, at the closing
+  paren. Confirmed via `grep -n "borrow\|Self" tests/traits_impls.rs`:
+  every `borrow` in Phase 4's passing tests is the *parameter*-position
+  form (`borrow self`, `borrow mut self`); none is in *type* position
+  (after a colon), and bare `Self`-as-a-type never appears at all —
+  confirming this was a real, previously-uncovered gap, not a
+  regression.
+- **Fix, applied once in `parse_type()` itself** (not per-call-site),
+  so it's closed uniformly for every type position that flows through
+  that function — return types, struct fields, generic arguments,
+  where-clause bound types, not just function parameters: added a
+  `Keyword::Borrow` branch mirroring the existing `&Type` branch exactly
+  (`borrow Type`/`borrow mut Type` reuses the existing `Type::Ref`
+  variant — checked `ast.rs` first, per standing practice, before
+  considering a new variant; none was needed).
+- **Second half of the fix**: even with parsing fixed, `types.rs` needed
+  to actually resolve `Self` to the enclosing `impl`'s concrete type.
+  Fixed in two places, both reusing the *existing* `mark_type_params` +
+  `substitute_type_params` pipeline (treating `Self` as a one-element
+  generic-parameter substitution scoped to the current impl, rather than
+  writing a third, separate substitution mechanism):
+  - `check_fn` — so a method body's own `Self`-typed parameters/return
+    type resolve to the concrete impl type while checking that body.
+  - `register_impls` — found by explicitly checking "could this same gap
+    bite anywhere else", per the standing instruction, rather than
+    stopping at the one call site the error pointed to: the *registered*
+    method signature (what `resolve_method` hands back to a real call
+    site elsewhere in the program) was **also** left with `Self`
+    unresolved, since it used plain `resolve_type` independently of
+    `check_fn`. Not yet exercised by any test (nothing in the current
+    suite calls `.compareTo()` on a value through the registry), but the
+    same bug class — fixed the same way, proactively, rather than
+    leaving a known-but-unexercised gap for a future phase to rediscover
+    the hard way.
+- **One deliberately unaddressed, flagged consideration found along the
+  way**: a *trait's own* declared signature (as opposed to an `impl`'s)
+  correctly leaves `Self` unresolved (appropriate — a trait has no one
+  concrete `Self` until implemented), but this means a `dyn Trait` method
+  whose signature mentions `Self` in parameter position (like
+  `compareTo`) can't be soundly type-checked against a real argument
+  through dynamic dispatch — this mirrors real object-safety rules
+  (Rust restricts exactly this class of method from `dyn` use for the
+  same underlying reason). Not solved this round — no current test
+  exercises calling `Self`-parameterized methods through `dyn` — but
+  worth surfacing rather than leaving implicit.
+
+Re-verified with the same standing checks (balance, AST cross-reference
+script, glob-import audit — all clean) plus hand-tracing all three
+previously-failing tests token-by-token through both fixes, and
+re-checking all nine previously-passing tests for whether either fix
+could have changed their behavior (confirmed: no — the parser fix is
+purely additive for a previously-unparseable construct, and the
+`types.rs` fixes are no-ops whenever no `Self` reference is actually
+present, which is true for all nine).
+
 ## Phases 6–25
 **Status: ⚪ Not started**
 
