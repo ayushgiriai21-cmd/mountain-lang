@@ -933,6 +933,34 @@ impl Parser {
             let inner = self.parse_type()?;
             return Ok(Type::Ref { lifetime, mutable, inner: Box::new(inner) });
         }
+        if self.eat_kw(Keyword::Borrow) {
+            // `borrow Type` / `borrow mut Type` in TYPE position (as
+            // opposed to `borrow`/`borrow mut` as a *parameter*
+            // ownership modifier before the param name, which
+            // `parse_param` already handles separately) — Document 7
+            // §4.1's own canonical trait example uses this exact form:
+            // `fn compareTo(borrow self, other: borrow Self) -> i32;`.
+            // Previously `parse_type()` had no branch for
+            // `Keyword::Borrow` at all, so it fell through to the
+            // generic keyword-as-word fallback and silently mis-parsed
+            // "borrow" itself as a bogus type name (`Type::Named("borrow")`),
+            // with the resulting error only surfacing later at the
+            // closing paren once the leftover `Self` token didn't match
+            // anything expected. Fixed here, once, in `parse_type`
+            // itself (not per-call-site), so this is closed uniformly
+            // for every type position that flows through this function
+            // — return types, struct fields, generic arguments,
+            // where-clause bound types — not just function parameters.
+            // Reuses `Type::Ref` (the same AST shape `&Type` already
+            // produces just above) rather than inventing a new variant,
+            // since `borrow Type` and `&Type` are the same underlying
+            // concept spelled two ways (Document 6 §3's `ref x` note
+            // makes the same equivalence for the expression-position
+            // spelling).
+            let mutable = self.eat_kw(Keyword::Mut);
+            let inner = self.parse_type()?;
+            return Ok(Type::Ref { lifetime: None, mutable, inner: Box::new(inner) });
+        }
         if self.eat_kw(Keyword::Dyn) {
             let name = self.expect_word()?;
             let args = self.parse_generic_args_opt()?;

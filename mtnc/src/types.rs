@@ -605,14 +605,30 @@ impl TypeChecker {
         if let ItemKind::Impl(impl_decl) = &item.kind {
             let target_name = impl_decl.target.name.clone();
             let trait_name = impl_decl.trait_ref.as_ref().map(|tr| tr.name.clone());
+            // Same `Self`-substitution as `check_fn` (see its doc
+            // comment), applied here too so a *registered* method
+            // signature (what `resolve_method` hands back to a real
+            // call site) has `Self` resolved to the concrete target
+            // type, not just the body-checking pass. Consistent with
+            // `check_item`'s `ItemKind::Impl` branch, which builds the
+            // same `Ty::Named(target.name)` self-type — generic impl
+            // targets aren't handled at all yet (Phase 4/5 doesn't
+            // consult `impl_decl.generics` anywhere), so this is exactly
+            // as simplified as the rest of the impl-checking pipeline
+            // already is, not a new gap introduced here.
+            let self_ty = Ty::Named(target_name.clone());
+            let self_subst: HashMap<String, Ty> = std::iter::once(("Self".to_string(), self_ty)).collect();
+            let resolve_with_self = |ty: &Type| -> Ty {
+                substitute_type_params(&mark_type_params(resolve_type(ty), &["Self".to_string()]), &self_subst)
+            };
 
             let methods: HashMap<String, FnSig> = impl_decl.items.iter().filter_map(|ii| match ii {
                 ImplItem::Fn(f) => {
                     let params = f.params.iter()
                         .filter(|p| p.name != "self")
-                        .map(|p| resolve_type(&p.ty))
+                        .map(|p| resolve_with_self(&p.ty))
                         .collect();
-                    let ret = f.return_type.as_ref().map(resolve_type).unwrap_or(Ty::Unit);
+                    let ret = f.return_type.as_ref().map(|t| resolve_with_self(t)).unwrap_or(Ty::Unit);
                     Some((f.name.clone(), FnSig { params, ret, has_default_body: true }))
                 }
                 ImplItem::AssocType(..) => None,
@@ -691,6 +707,33 @@ impl TypeChecker {
     fn check_fn(&mut self, f: &FnDecl, self_ty: Option<&Ty>) {
         let Some(body) = &f.body else { return };
         let mut env = Env::new();
+        // When checking a method body (`self_ty` is `Some`), any
+        // parameter/return type written as `Self` (Document 7 §4.1's
+        // own canonical trait-method example, `other: borrow Self`)
+        // must resolve to the enclosing `impl`'s concrete target type,
+        // not stay as an unresolved `Ty::Named("Self")` placeholder —
+        // the three Phase 5 test failures this fixes specifically
+        // needed `compareTo`'s `Self` parameter to resolve to `i32`
+        // inside `impl Comparable for i32`. Reuses the existing
+        // mark-then-substitute pipeline already built for ordinary
+        // generic type parameters (`mark_type_params` +
+        // `substitute_type_params`) rather than writing a separate
+        // substitution mechanism — "Self" is treated as if it were a
+        // one-element generic parameter list scoped to this single
+        // function-checking call, which is structurally exactly what
+        // it is.
+        let self_subst: HashMap<String, Ty> = match self_ty {
+            Some(t) => std::iter::once(("Self".to_string(), t.clone())).collect(),
+            None => HashMap::new(),
+        };
+        let resolve_with_self = |ty: &Type| -> Ty {
+            let raw = resolve_type(ty);
+            if self_ty.is_some() {
+                substitute_type_params(&mark_type_params(raw, &["Self".to_string()]), &self_subst)
+            } else {
+                raw
+            }
+        };
         for p in &f.params {
             if p.name == "self" {
                 if let Some(t) = self_ty {
@@ -698,9 +741,9 @@ impl TypeChecker {
                 }
                 continue;
             }
-            env.insert(p.name.clone(), resolve_type(&p.ty));
+            env.insert(p.name.clone(), resolve_with_self(&p.ty));
         }
-        let expected_ret = f.return_type.as_ref().map(resolve_type);
+        let expected_ret = f.return_type.as_ref().map(|t| resolve_with_self(t));
         self.check_block(body, &mut env, expected_ret.as_ref(), &f.name);
     }
 
